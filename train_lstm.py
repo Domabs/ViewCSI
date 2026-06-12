@@ -1,6 +1,7 @@
 import pymysql
 import pandas as pd
 import numpy as np
+from sqlalchemy import create_engine
 import json
 import torch
 import torch.nn as nn
@@ -17,10 +18,12 @@ DB_PASSWORD = "a1234"
 DB_NAME = "ruview"
 
 print("[*] DB에서 데이터 가져오는 중...")
-conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+
+db_url = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
+engine = create_engine(db_url)
+
 query = "SELECT avg_amplitude AS variance, raw_data, label FROM csi_logs ORDER BY timestamp ASC"
-df = pd.read_sql(query, conn)
-conn.close()
+df = pd.read_sql(query, engine)
 
 # JSON 파형 데이터 풀기
 EXPECTED_LEN = 770
@@ -84,7 +87,7 @@ test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
 
 # 모델 크기 385 * 2 = 770 (s3 보드 2개로 수집)
 class CSILSTM(nn.Module):
-    def __init__(self, input_size=770, hidden_size=128, num_classes=3):
+    def __init__(self, input_size=771, hidden_size=128, num_classes=4):
         super().__init__()
         # 시계열 기억 장치 (LSTM)
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
@@ -97,7 +100,7 @@ class CSILSTM(nn.Module):
         out = self.fc(out[:, -1, :]) 
         return out
 
-model = CSILSTM(input_size=193, hidden_size=64, num_classes=len(encoder.classes_)).to(device)
+model = CSILSTM(input_size=771, hidden_size=64, num_classes=len(encoder.classes_)).to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 

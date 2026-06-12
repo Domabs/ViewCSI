@@ -4,26 +4,29 @@ import time
 import requests
 import numpy as np
 import pandas as pd
+import os
 
 # ==========================================
-# 💡 세팅: 수집할 행동과 EC2 주소 입력
+# EC2 FastAPI / S3보드 연동
 # ==========================================
 EC2_URL = "http://54.205.230.141:8000/api/csi/upload"
 BOARD_IPS = ["192.168.219.106", "192.168.219.105" ] 
 # "192.168.219.105", "192.168.219.107" 
 
-#  지금 수집할 행동을 여기에 적으세요! (empty, sitting, walking)
-CURRENT_LABEL = input('수집할 행동 라벨 선택 -\n(empty, sitting, walking) : ') 
+# 수집 행동
+CURRENT_LABEL = input('수집할 행동 라벨 선택 (택 1)\n(empty, sitting, walking, lying) : ') 
+TARGET_NUMBER = input('수집할 데이터 개수 : ')
 # ==========================================
 
 csi_buffers = {ip: [] for ip in BOARD_IPS}
 buffer_lock = threading.Lock()
 EXPECTED_LEN = 192
 
+
 def udp_receiver():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", 8888))
-    print(f"[*] 듀얼 보드 동기화 수집기 가동 중... (목표 라벨: {CURRENT_LABEL.upper()})")
+    print(f"[*] 듀얼 보드 동기화 후 수집 : (목표 라벨: {CURRENT_LABEL.upper()})")
 
     while True:
         try:
@@ -39,7 +42,7 @@ def udp_receiver():
                         csi_buffers[sender_ip].append(amplitude)
         except: pass
 
-# 💡 보드 1대 분량의 특징(385개)을 추출하는 함수
+#  보드 1대 분량의 특징(385개)을 추출하는 함수
 def extract_features(data_list):
     df = pd.DataFrame(data_list)
     mean_wave = df.mean(axis=0).fillna(0).round(2).tolist()
@@ -70,10 +73,12 @@ def processor():
             csi_buffers[ip1].clear()
             csi_buffers[ip2].clear()
             
-        # 🚀 [핵심 방어 로직] 둘 중 하나라도 통신이 끊겼다면 데이터 폐기!
+        #  =================================
+        #  둘 중 하나라도 통신이 끊겼다면 데이터 폐기!
         if not data1 or not data2:
             print(f"[-] 동기화 대기/유실... (수신 패킷 - {ip1}: {len(data1)}개 / {ip2}: {len(data2)}개)")
             continue
+        #  =================================
             
         try:
             # 1. 각각 385개의 특징 추출
@@ -98,6 +103,9 @@ def processor():
 
             print(f"[수집 - {count}] 동기화 완료 (패킷 {min_packet_count}개) | {CURRENT_LABEL.upper()} DB 전송: {res.status_code}")
             count += 1
+            if(count >= int(TARGET_NUMBER)):
+                print(f'목표 데티어 {TARGET_NUMBER}개 수집 완료')
+                os._exit(0)
             
         except Exception as e:
             print(f"[!] 전처리 및 전송 에러: {e}")

@@ -8,22 +8,29 @@ import collections
 import torch
 import torch.nn as nn
 import joblib
+import torch.nn.functional as F
+from collections import deque
 
 # ==========================================
 # 세팅: 실시간 예측 API 주소
 # ==========================================
 EC2_URL = "http://54.205.230.141:8000/api/csi/upload"
-BOARD_IPS = ["192.168.219.106" ] 
+BOARD_IPS = ["192.168.219.106", "192.168.219.105" ] 
 # "192.168.219.105", "192.168.219.107" 
 
+# 다수결 스무딩을 위한 3칸짜리 버퍼 추가 (processor 함수 바깥 윗부분에 선언)
+pred_history = collections.deque(maxlen=3)
+
 # ==========================================
-#  딥러닝(LSTM) 불러오기 (train_lstm.py 구조와 동일해야 함)
+#  딥러닝(LSTM) 불러오기 
+# (train_lstm.py 구조와 동일해야 함)
 # ==========================================
 class CSILSTM(nn.Module):
-    def __init__(self, input_size=385, hidden_size=128, num_classes=3):
+    def __init__(self, input_size=771, hidden_size=64, num_classes=4):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, num_classes)
+        
     def forward(self, x):
         out, _ = self.lstm(x)
         return self.fc(out[:, -1, :])
@@ -31,25 +38,26 @@ class CSILSTM(nn.Module):
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 try:
-    # 스케일러와 라벨 번역기 로드
     scaler = joblib.load('csi_scaler.pkl')
     encoder = joblib.load('csi_encoder.pkl')
     
-    # 모델 뼈대 만들고 가중치 덮어씌우기
-    model = CSILSTM(input_size=385, hidden_size=128, num_classes=len(encoder.classes_)).to(device)
+    # 모델 뼈대 만들고 방금 훈련한 가중치 덮어씌우기
+    model = CSILSTM(input_size=771, hidden_size=64, num_classes=len(encoder.classes_)).to(device)
     model.load_state_dict(torch.load('csi_lstm_weights.pth'))
-    model.eval() # 실전(추론) 모드로 변경
-    print("[*] LSTM 모델 로딩 완료")
+    model.eval() 
+    print("[*] LSTM(듀얼 보드) 모델 로딩 완료")
 except Exception as e:
-    print(f"[!] 모델 로딩 실패 (train_lstm.py부터 돌리세요): {e}")
+    print(f"[!] 모델 로딩 실패: {e}")
     exit()
 
-#  3초(3프레임) 윈도우 저장을 위한 큐(Queue)
-history_buffer = {ip: collections.deque(maxlen=5) for ip in BOARD_IPS}
+# ==========================================
+# 듀얼 보드 동기화 및 5초 기억 버퍼 세팅
+# ==========================================
+# 보드 2개가 하나로 합쳐지므로, 버퍼도 IP별로 나누지 않고 '통합 버퍼 1개'만 씁니다.
+history_buffer = collections.deque(maxlen=5) 
 csi_buffers = {ip: [] for ip in BOARD_IPS}
 buffer_lock = threading.Lock()
 EXPECTED_LEN = 192
-# ai_model.n_features_in_ - 1
 
 def udp_receiver():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -69,64 +77,137 @@ def udp_receiver():
                         csi_buffers[sender_ip].append(amplitude)
         except: pass
 
+def extract_features(data_list):
+    df = pd.DataFrame(data_list)
+    mean_wave = df.mean(axis=0).fillna(0).round(2).tolist()
+    std_wave = df.std(axis=0).fillna(0).round(2).tolist()
+    
+    def fix_length(wave, target_len=EXPECTED_LEN):
+        if len(wave) < target_len: return wave + [0.0] * (target_len - len(wave))
+        return wave[:target_len]
+    
+    variance = float(df.var().mean()) if len(df) > 1 else 0.0
+    if pd.isna(variance): variance = 0.0
+    
+    # 385개 반환 (분산 1 + 평균 192 + 편차 192)
+    features = [round(variance, 2)] + fix_length(mean_wave) + fix_length(std_wave)
+    return features, variance
+
 def processor():
+    ip1, ip2 = BOARD_IPS[0], BOARD_IPS[1]
+    
     while True:
-        time.sleep(1.0) # 1초마다 루프
+        time.sleep(1.0) 
         with buffer_lock:
-            batch_data = {ip: csi_buffers[ip][:] for ip in BOARD_IPS}
-            for ip in BOARD_IPS: csi_buffers[ip].clear()
+            data1 = csi_buffers[ip1][:]
+            data2 = csi_buffers[ip2][:]
+            csi_buffers[ip1].clear()
+            csi_buffers[ip2].clear()
+            
+        # 한쪽이라도 끊기면 딥러닝 뇌를 오염시키지 않도록 버림
+        if not data1 or not data2:
+            print(f"[-] 동기화 대기/유실... (수신 패킷 - {ip1}: {len(data1)} / {ip2}: {len(data2)})")
+            continue
+            
+        try:
+            feat1, var1 = extract_features(data1)
+            feat2, var2 = extract_features(data2)
+            
+            # 1. 보드 2개 데이터 병합 (385 + 385 = 770개)
+            synced_features = feat1 + feat2
+            avg_variance = round((var1 + var2) / 2, 2)
+            
+            # 2. AI 입력용 최종 데이터 조립 (평균분산 1 + 합친 파형 770 = 771개)
+            current_feature = [avg_variance] + synced_features
+            
+            # 3. 5초 기억 장치에 밀어 넣음
+            history_buffer.append(current_feature)
+            
+            # 4. 5초치 데이터가 꽉 찼을 때만 AI 가동
+            if len(history_buffer) == 5:
+                # (5, 771) 형태의 배열로 변환
+                seq_data = np.array(history_buffer) 
+                seq_scaled = scaler.transform(seq_data) 
                 
-        for ip, data_list in batch_data.items():
-            if not data_list: continue
-            try:
-                df = pd.DataFrame(data_list)
-                mean_wave = df.mean(axis=0).fillna(0).round(2).tolist()
-                std_wave = df.std(axis=0).fillna(0).round(2).tolist()
+                # [1, 5, 771] 차원의 파이토치 텐서 생성
+                tensor_data = torch.FloatTensor([seq_scaled]).to(device)
                 
-                def fix_length(wave, target_len=192):
-                    if len(wave) < target_len: return wave + [0.0] * (target_len - len(wave))
-                    return wave[:target_len]
-                
-                combined_wave = fix_length(mean_wave) + fix_length(std_wave)
-                variance = float(df.var().mean()) if len(df) > 1 else 0.0
-                if pd.isna(variance): variance = 0.0
-                
-                # 1. 특징 배열 조립 (총 385개)
-                current_feature = [variance] + combined_wave 
-                
-                # 2. 5초 기억 장치에 밀어 넣음
-                history_buffer[ip].append(current_feature)
-                
-                # 3. 5초 데이터 꽉 찼을 때 AI 예측 (len 확인 5로 변경)
-                if len(history_buffer[ip]) == 5:
-                    seq_data = np.array(history_buffer[ip])
+                # AI 예측
+                with torch.no_grad():
+                    out = model(tensor_data)
                     
-                    # 훈련할 때와 똑같이 스케일링(정규화)
-                    seq_scaled = scaler.transform(seq_data) 
+                    # 1. 단순 1등 뽑기가 아니라 확률 계산
+                    probs = F.softmax(out, dim=1)
+                    max_prob, pred_idx = torch.max(probs, dim=1)
                     
-                    # 파이토치 텐서로 변환 (배치 사이즈 1추가 -> [1, 3, 193])
-                    tensor_data = torch.FloatTensor([seq_scaled]).to(device)
+                    confidence = max_prob.item() * 100
+                    predicted_label = encoder.inverse_transform([pred_idx.item()])[0]
+
+
+                # ==========================================
+                # 물리 법칙 필터 (Hard Filter) 추가
+                # 걷기(Walking)라면 무조건 분산(avg_variance)이 높아야 함 
+                # (WALING_THRESHOLD 값 이상)
+                # ==========================================
+                WALKING_THRESHOLD = 3.0 # 환경에 맞게 조정 (avg_variance 값)
+                
+                
+                # 2. 보정 2단계: 다수결 스무딩 (최근 3번의 확실한 예측 중 대세 따르기)
+                pred_history.append(predicted_label)
+                if len(pred_history) < 3:
+                    print(f"[-] 다수결 데이터 모으는 중... ({len(pred_history)}/3)")
+                    continue
+                
+
+                # =========================================
+                # Walking으로 잘못 판단 했을때 
+                # sitting/lying중 더 높은 확률 로 선택
+                # =========================================
+                if predicted_label == 'walking' and avg_variance < WALKING_THRESHOLD:
+                    # 1. 라벨 번역기에서 'walking'의 고유 번호(Index)를 찾음
+                    walking_idx = encoder.transform(['walking'])[0]
                     
-                    # AI 예측
-                    with torch.no_grad():
-                        out = model(tensor_data)
-                        pred_idx = torch.argmax(out, dim=1).item()
-                        predicted_label = encoder.inverse_transform([pred_idx])[0]
+                    # 2. AI (확률표)에서 'walking'의 확률만 0.0으로 완전 삭제
+                    probs[0][walking_idx] = 0.0 
                     
-                    # EC2 실시간 테이블로 전송
-                    payload = {
-                        "device_id": ip,
-                        "variance": round(variance, 2),
-                        "mean_wave": mean_wave,
-                        "predicted_action": str(predicted_label)
-                    }
-                    res = requests.post(EC2_URL, json=payload, timeout=2)
-                    print(f"[+] {ip} | 🤖 예측:[{predicted_label.upper()}] | 전송: {res.status_code}")
-                else:
-                    print(f"[-] {ip} | 데이터 묶는 중... ({len(history_buffer[ip])}/3)")
+                    # 3. 남은 후보들(empty, sitting, lying) 중에서 다시 1등(기존 2등)을 뽑음
+                    new_max_prob, new_pred_idx = torch.max(probs, dim=1)
+                    predicted_label = encoder.inverse_transform([new_pred_idx.item()])[0]
                     
-            except Exception as e:
-                print(f"[!] {ip} 예측/전송 에러: {e}")
+                    # 4. 남은 애들끼리의 비율로 확신도(%)를 다시 계산
+                    confidence = (new_max_prob.item() / torch.sum(probs).item()) * 100
+                    
+                    print(f"[!] 오판 감지: 차선책 [{predicted_label.upper()}] - (Confidence: {confidence:.1f}%)")
+                
+                # Confidence 컷시킴
+                # 차선책으로 선택된 label도 confidence 낮으면 보류됨
+                if confidence < 75.0:
+                    print(f"[-] (Lack Confidence: {confidence:.1f}%) -> maybe {predicted_label.upper()}")
+                    continue # 서버로 전송 안 하고 다음 1초로 넘어감
+
+                pred_history.append(predicted_label)
+                if len(pred_history) < 3:
+                    continue
+                
+                # 3개 중 가장 많이 나온 행동을 최종 정답으로 채택
+                final_label = max(set(pred_history), key=pred_history.count)
+
+                # ==========================================
+                
+                # EC2 전송
+                payload = {
+                    "device_id": "DUAL_BOARD_SYNC",
+                    "variance": avg_variance,
+                    "mean_wave": synced_features,
+                    "predicted_action": str(final_label) #필터링된 최종값
+                }
+                res = requests.post(EC2_URL, json=payload, timeout=2)
+                print(f"[+] Predict : [{final_label.upper():>7}] | 분산: {avg_variance} | Confidence:{confidence:.1f}% | 전송상태: {res.status_code}")
+            else:
+                print(f"[-] 5초 시계열 데이터 묶는 중... ({len(history_buffer)}/5)")
+                
+        except Exception as e:
+            print(f"[!] 예측/전송 에러: {e}")
 
 if __name__ == "__main__":
     threading.Thread(target=udp_receiver, daemon=True).start()
