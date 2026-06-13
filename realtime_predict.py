@@ -57,6 +57,11 @@ EXPECTED_LEN = 192
 
 def udp_receiver():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # 운영체제 수신 버퍼 사이즈 1MB로 강제 확장 (패킷드랍 방지)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+
+
     sock.bind(("0.0.0.0", 8888))
     print("[*] 실시간 행동 추론 모니터링 시작")
     while True:
