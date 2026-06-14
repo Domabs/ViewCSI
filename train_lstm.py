@@ -87,7 +87,8 @@ test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
 
 # 모델 크기 385 * 2 = 770 (s3 보드 2개로 수집)
 class CSILSTM(nn.Module):
-    def __init__(self, input_size=771, hidden_size=128, num_classes=4):
+    # num_class : label 개수 (현 3개 - empty, sitting, walking)
+    def __init__(self, input_size=771, hidden_size=128, num_classes=3): 
         super().__init__()
         # 시계열 기억 장치 (LSTM)
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)

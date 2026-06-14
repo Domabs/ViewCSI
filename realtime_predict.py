@@ -14,15 +14,15 @@ from collections import deque
 # ==========================================
 # 세팅: 실시간 예측 API 주소 및 S3 보드 IP주소
 # ==========================================
-EC2_URL = "http://54.205.230.141:8000/api/csi/upload"
-BOARD_IPS = ["192.168.219.106", "192.168.219.105" ]
+EC2_URL = "http://54.205.230.141:8000/api/csi/realtime"
+BOARD_IPS = ["192.168.219.114", "192.168.219.105" ]
 
 # ==========================================
 #  딥러닝(LSTM 모델) 불러오기 
-# (train_lstm.py 구조와 동일해야 함)
+# (train_lstm.py 의 CSILSTM 함수 구조와 동일해야 함)
 # ==========================================
 class CSILSTM(nn.Module):
-    def __init__(self, input_size=771, hidden_size=64, num_classes=4):
+    def __init__(self, input_size=771, hidden_size=64, num_classes=3):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, num_classes)
@@ -192,7 +192,8 @@ def processor():
                     # ([]_THRESHOLD 값 이상)
                     # ==========================================
                    
-
+                    # WALKING이라 인식했지만 분산값이 낮을때 
+                    # WALKING을 제외하고 다시 판단함.
                     if predicted_label == 'walking' and avg_variance < WALKING_THRESHOLD:
                         # 1. 라벨 번역기에서 'walking'의 고유 번호(Index)를 찾음
                         walking_idx = encoder.transform(['walking'])[0]
@@ -204,13 +205,24 @@ def processor():
                         new_max_prob, new_pred_idx = torch.max(probs, dim=1)
                         predicted_label = encoder.inverse_transform([new_pred_idx.item()])[0]
                         
-                        # 4. 남은 애들끼리의 비율로 확신도(%)를 다시 계산
+                        # 4. 남은 애들끼리 비율로 확신도(%)를 다시 계산
                         confidence = (new_max_prob.item() / torch.sum(probs).item()) * 100
                         
                         print(f"[!] Detected Misjudgment : Alternative [{predicted_label.upper()}] - (Confidence: {confidence:.1f}%)")
+                    
+                    if predicted_label == 'empty' and avg_variance >= WALKING_THRESHOLD:
+                        empty_idx = encoder.transform(['empty'])[0]
+
+                        probs[0][empty_idx] = 0.0
+                        new_max_prob, new_pred_idx = torch.max(probs, dim=1)
+                        predicted_label = encoder.inverse_transform([new_pred_idx.item()])[0]
+
+                        confidence = (new_max_prob.item() / torch.sum(probs).item())*100
+                        print(f"[!] Detected Over-Variance : Delete Empty > new Inference[{predicted_label.upper()}] - (Confidence: {confidence:.1f}%)")
+
 
                 else:
-                    print(f"[-] Archiving Time Series Data for 5s ({len(history_buffer)}/5)")
+                    print(f"[-] Archiving Time Series Data for 5s... ({len(history_buffer)}/5)")
                     continue
 
             # Confidence 컷시킴
